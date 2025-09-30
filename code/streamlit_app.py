@@ -212,9 +212,26 @@ def post_process_with_llm(text: str, model) -> str:
     if not text or not model:
         return text or ""
     try:
-        resp = model.generate_content(
-            "You are a medical transcription specialist. Clean and correct the following transcription conservatively without adding information. Return a single paragraph without headers or lists.\n\n" + text
-        )
+        prompt = f"""
+You are a medical transcription specialist. Please clean and correct the following medical transcription to make it more accurate, professional, and properly formatted for medical reports.
+
+Guidelines:
+1. Fix any obvious transcription errors
+2. Ensure proper medical terminology
+3. Maintain the original meaning and medical findings
+4. Use proper medical formatting and punctuation
+5. Keep the same structure and content as the original
+6. Do not add information that wasn't in the original text
+7. Return ONLY the cleaned text without any formatting symbols, bullet points, or section headers
+8. Return the text as a single paragraph without line breaks
+9. Do not add any introductory text like "Here is the cleaned version" or similar
+
+Original transcription:
+{text}
+
+Please provide the cleaned and corrected version as a single paragraph:
+"""
+        resp = model.generate_content(prompt)
         return clean_llm_response(resp.text.strip())
     except Exception:
         return text
@@ -476,6 +493,12 @@ if 'recordings' not in st.session_state:
     st.session_state.recordings = []
 if 'recordings_table' not in st.session_state:
     st.session_state.recordings_table = []
+if 'last_results' not in st.session_state:
+    st.session_state.last_results = None
+if 'metrics_computed' not in st.session_state:
+    st.session_state.metrics_computed = False
+if 'comparison_rows' not in st.session_state:
+    st.session_state.comparison_rows = []
 
 def main():
     """Main Streamlit app"""
@@ -569,31 +592,7 @@ def main():
         else:
             st.warning("⚠️ Groq API key not found. Set GROQ_API_KEY environment variable to use API models.")
 
-        # LLM Post-processing and Metrics
-        st.header("🧠 Post-processing & Metrics")
-        if 'ground_truth' not in st.session_state:
-            st.session_state.ground_truth = ""
-        if 'use_gemini_post' not in st.session_state:
-            st.session_state.use_gemini_post = False
-        if 'gemini_model_ready' not in st.session_state:
-            st.session_state.gemini_model_ready = bool(os.getenv('GOOGLE_API_KEY'))
-
-        st.session_state.ground_truth = st.text_area(
-            "Ground Truth (optional)",
-            value=st.session_state.ground_truth,
-            help="Provide ground truth text to compute WER/CER (stopwords removed) and cosine similarity."
-        )
-
-        st.session_state.use_gemini_post = st.checkbox(
-            "Use Gemini LLM post-processing", value=st.session_state.use_gemini_post,
-            help="Requires GOOGLE_API_KEY. Cleans model outputs before metrics."
-        )
-
-        if st.session_state.use_gemini_post:
-            if not os.getenv('GOOGLE_API_KEY'):
-                st.warning("GOOGLE_API_KEY not set; LLM post-processing will be skipped.")
-            else:
-                st.info("Gemini post-processing enabled")
+        # (Ground truth and Gemini controls moved to main area below)
         
         # Instructions
         st.header("📋 Instructions")
@@ -612,6 +611,33 @@ def main():
     # Main content area
     st.header("🎙️ Live Audio Recording")
     
+    # Ground truth and Gemini controls in main area
+    st.markdown("---")
+    st.subheader("🧠 Post-processing & Metrics")
+    if 'ground_truth' not in st.session_state:
+        st.session_state.ground_truth = ""
+    if 'use_gemini_post' not in st.session_state:
+        st.session_state.use_gemini_post = False
+    if 'gemini_model_ready' not in st.session_state:
+        st.session_state.gemini_model_ready = bool(os.getenv('GOOGLE_API_KEY'))
+
+    st.session_state.ground_truth = st.text_area(
+        "Ground Truth (optional)",
+        value=st.session_state.ground_truth,
+        help="Provide ground truth text to compute WER/CER (stopwords removed) and cosine similarity."
+    )
+
+    st.session_state.use_gemini_post = st.checkbox(
+        "Use Gemini LLM post-processing", value=st.session_state.use_gemini_post,
+        help="Requires GOOGLE_API_KEY. Cleans model outputs before metrics."
+    )
+
+    if st.session_state.use_gemini_post:
+        if not os.getenv('GOOGLE_API_KEY'):
+            st.warning("GOOGLE_API_KEY not set; LLM post-processing will be skipped.")
+        else:
+            st.info("Gemini post-processing enabled")
+
     # Recording status
     if st.session_state.model_loaded:
         st.markdown("""
@@ -666,7 +692,7 @@ def main():
                         st.error("No models selected. Please load models first.")
                     else:
                         results = {}
-                        
+
                         # Prepare optional Gemini model
                         gemini_model = setup_gemini_model() if st.session_state.use_gemini_post else None
 
@@ -692,7 +718,7 @@ def main():
                                         "error": err,
                                         "time_sec": dur,
                                     }
-                        
+
                         # Process Groq API models
                         groq_models = [m for m in selected_models if m.startswith('groq/')]
                         for groq_model in groq_models:
@@ -718,58 +744,26 @@ def main():
                                 "error": err,
                                 "time_sec": dur,
                             }
-                        
+
                         if not results:
                             st.error("No models loaded.")
                         else:
-                            # Build comparison table and pick first successful text as editable default
-                            rows = []
-                            editable_text = None
+                            # Store raw results for later metric computation
+                            st.session_state.last_results = results
+                            # Show a preview table with outputs and times only
+                            preview_rows = []
                             for name, out in results.items():
                                 label = model_options.get(name, name)
-                                text = out.get("text", "")
-                                err = out.get("error")
-                                tsec = out.get("time_sec", 0.0)
-                                # Metrics against ground truth, if provided
-                                gt = st.session_state.ground_truth or ""
-                                post_text = out.get("post_text", "")
-                                wer_val = cer_val = cos_val = None
-                                wer_post = cer_post = cos_post = None
-                                if gt and text:
-                                    m = compute_wer_cer(gt, text)
-                                    wer_val, cer_val = m["wer"], m["cer"]
-                                    cos_val = compute_cosine_similarity(gt, text)
-                                if gt and post_text:
-                                    m2 = compute_wer_cer(gt, post_text)
-                                    wer_post, cer_post = m2["wer"], m2["cer"]
-                                    cos_post = compute_cosine_similarity(gt, post_text)
-
-                                rows.append({
+                                preview_rows.append({
                                     "Model": label,
-                                    "Output": text if text else (err or ""),
-                                    "Output (Processed)": post_text if post_text else "",
-                                    "Time": f"{tsec:.2f}s",
-                                    "WER": wer_val,
-                                    "CER": cer_val,
-                                    "Cosine": cos_val,
-                                    "WER (Processed)": wer_post,
-                                    "CER (Processed)": cer_post,
-                                    "Cosine (Processed)": cos_post,
-                                    "Status": "OK" if text else "ERR",
+                                    "Output": out.get("text", ""),
+                                    "Output (Processed)": out.get("post_text", ""),
+                                    "Time": f"{out.get('time_sec', 0.0):.2f}s",
+                                    "Status": "OK" if out.get("text") else "ERR",
                                 })
-                                if editable_text is None and text:
-                                    editable_text = text
-                            
-                            st.subheader("🧪 Model Comparison")
-                            st.table(pd.DataFrame(rows))
-                            
-                            if editable_text:
-                                st.session_state.transcription_text = editable_text
-                                # Add to recordings table
-                                add_recording_to_table(editable_text, results)
-                                st.success("✅ Comparison completed! Edit the text on the right.")
-                            else:
-                                st.warning("⚠️ None of the models produced text.")
+                            st.subheader("🧪 Model Outputs (Preview)")
+                            st.table(pd.DataFrame(preview_rows))
+                            st.info("Provide Ground Truth and click Compute to calculate metrics.")
     
     # Transcription section
     st.header("📝 Live Transcription")
@@ -787,19 +781,75 @@ def main():
     if transcription_text != st.session_state.transcription_text:
         st.session_state.transcription_text = transcription_text
     
-    # Action buttons
+    # Action buttons: Compute, Add to recording table, Reset
     col1, col2, col3, col4, col5 = st.columns(5)
-    
+
     with col1:
-        if st.button("🗑️ Clear Text"):
-            st.session_state.transcription_text = ""
-            st.rerun()
-    
+        compute_disabled = not (st.session_state.ground_truth.strip() and st.session_state.last_results)
+        if st.button("🧮 Compute", disabled=compute_disabled, type="primary"):
+            rows = []
+            gt = st.session_state.ground_truth
+            results = st.session_state.last_results or {}
+            for name, out in results.items():
+                label = name
+                text = out.get("text", "")
+                post_text = out.get("post_text", "")
+                tsec = out.get("time_sec", 0.0)
+                wer_val = cer_val = cos_val = None
+                wer_post = cer_post = cos_post = None
+                if gt and text:
+                    m = compute_wer_cer(gt, text)
+                    wer_val, cer_val = m["wer"], m["cer"]
+                    cos_val = compute_cosine_similarity(gt, text)
+                if gt and post_text:
+                    m2 = compute_wer_cer(gt, post_text)
+                    wer_post, cer_post = m2["wer"], m2["cer"]
+                    cos_post = compute_cosine_similarity(gt, post_text)
+                rows.append({
+                    "Model": label,
+                    "Output": text,
+                    "Output (Processed)": post_text,
+                    "Time": f"{tsec:.2f}s",
+                    "WER": wer_val,
+                    "CER": cer_val,
+                    "Cosine": cos_val,
+                    "WER (Processed)": wer_post,
+                    "CER (Processed)": cer_post,
+                    "Cosine (Processed)": cos_post,
+                })
+            st.session_state.comparison_rows = rows
+            st.session_state.metrics_computed = True
+
     with col2:
+        add_disabled = not (st.session_state.metrics_computed and st.session_state.comparison_rows and st.session_state.last_results)
+        if st.button("➕ Add to recording table", disabled=add_disabled):
+            # Use first successful text as editable default if needed
+            editable_text = None
+            for name, out in (st.session_state.last_results or {}).items():
+                candidate = out.get("text")
+                if candidate:
+                    editable_text = candidate
+                    break
+            if editable_text:
+                add_recording_to_table(editable_text, st.session_state.last_results)
+                st.success("✅ Added to recordings table!")
+            else:
+                st.warning("⚠️ No valid transcript to add.")
+
+    with col3:
+        if st.button("🧹 Reset"):
+            st.session_state.ground_truth = ""
+            st.session_state.transcription_text = ""
+            st.session_state.last_results = None
+            st.session_state.metrics_computed = False
+            st.session_state.comparison_rows = []
+            st.rerun()
+
+    with col4:
         if st.button("📋 Copy Text"):
             st.code(st.session_state.transcription_text)
-    
-    with col3:
+
+    with col5:
         if st.button("💾 Download"):
             if st.session_state.transcription_text:
                 st.download_button(
@@ -809,23 +859,11 @@ def main():
                     mime="text/plain"
                 )
     
-    with col4:
-        if st.button("📝 Add to Table"):
-            if st.session_state.transcription_text.strip():
-                # Create a simple model result for manual additions
-                manual_result = {
-                    'manual_transcript': st.session_state.transcription_text,
-                    'manual_time': 'N/A'
-                }
-                add_recording_to_table(st.session_state.transcription_text, {'manual': {'text': st.session_state.transcription_text, 'time_sec': 0}})
-                st.success("✅ Added to recordings table!")
-            else:
-                st.warning("⚠️ No text to add to table.")
-    
-    with col5:
-        if st.button("🔄 Refresh"):
-            st.rerun()
-    
+    # Show computed metrics table if available
+    if st.session_state.metrics_computed and st.session_state.comparison_rows:
+        st.subheader("📐 Metrics (Computed)")
+        st.table(pd.DataFrame(st.session_state.comparison_rows))
+
     # Recordings Table Section
     st.markdown("---")
     st.markdown('<div class="recordings-table">', unsafe_allow_html=True)
